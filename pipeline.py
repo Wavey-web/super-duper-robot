@@ -21,6 +21,19 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Python 3.10+ compatibility: collections.MutableMapping was removed in 3.10.
+# It was moved to collections.abc in Python 3.3. Many third-party packages
+# still reference collections.MutableMapping, so we monkey-patch it back.
+# ---------------------------------------------------------------------------
+import collections
+import collections.abc
+for _attr in ('MutableMapping', 'MutableSequence', 'MutableSet',
+              'Mapping', 'Sequence', 'Set', 'Callable', 'Iterable',
+              'Iterator', 'MutableSet'):
+    if not hasattr(collections, _attr) and hasattr(collections.abc, _attr):
+        setattr(collections, _attr, getattr(collections.abc, _attr))
+
 import numpy as np
 import cv2
 from scipy.fftpack import dct, idct
@@ -266,9 +279,9 @@ class PixelMutationStage:
     def run(self, ctx: PipelineContext) -> None:
         ctx.current_stage = self.name
         cfg = ctx.config
-        logger.info("Stage: Pixel Mutation — noise σ={}, LSB bits={}, hue={}°, sat={}%",
-                     cfg.gaussian_sigma, cfg.lsb_flip_count,
-                     cfg.hue_shift, cfg.sat_shift)
+        logger.info("Stage: Pixel Mutation — noise σ={}, LSB bits={}, hue={}°, sat={}%".format(
+            cfg.gaussian_sigma, cfg.lsb_flip_count,
+            cfg.hue_shift, cfg.sat_shift))
 
         frame_files = sorted([
             f for f in os.listdir(ctx.frames_dir) if f.endswith(".png")
@@ -1008,7 +1021,7 @@ class Pipeline:
         try:
             import torch
             if torch.cuda.is_available():
-                props = torch.get_device_properties(0)
+                props = torch.cuda.get_device_properties(0)
                 ctx.vram_mb = props.total_memory // (1024 * 1024)
                 ctx.device = "cuda:0"
                 # Auto-downscale if VRAM low
