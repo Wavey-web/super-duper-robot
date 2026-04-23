@@ -56,7 +56,7 @@ def _check_gpu() -> GPUInfo:
     try:
         import torch
         if torch.cuda.is_available():
-            props = torch.get_device_properties(0)
+            props = torch.cuda.get_device_properties(0)
             info.name = props.name
             info.vram_mb = props.total_memory // (1024 * 1024)
             info.cuda_version = torch.version.cuda or "N/A"

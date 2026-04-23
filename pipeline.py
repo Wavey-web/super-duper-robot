@@ -1099,33 +1099,33 @@ class QAVerificationStage:
             f for f in os.listdir(ctx.mutated_frames_dir) if f.endswith(".png")
         ])
 
-    # Sample frames for SSIM (every 10th frame, up to 30 frames).
-    # Account for temporal trimming: mutated frame at index i corresponds
-    # to original frame at index (i + trim_start).
-    trim_start = getattr(ctx, "trim_start", 0)
-    sample_indices = list(range(0, min(len(mut_files), len(orig_files) - trim_start), max(1, len(mut_files) // 30)))
-    if not sample_indices:
-        sample_indices = [0] if len(mut_files) > 0 else []
+        # Sample frames for SSIM (every 10th frame, up to 30 frames).
+        # Account for temporal trimming: mutated frame at index i corresponds
+        # to original frame at index (i + trim_start).
+        trim_start = getattr(ctx, "trim_start", 0)
+        sample_indices = list(range(0, min(len(mut_files), len(orig_files) - trim_start), max(1, len(mut_files) // 30)))
+        if not sample_indices:
+            sample_indices = [0] if len(mut_files) > 0 else []
 
-    ssim_scores = []
-    for i in sample_indices:
-        if i >= len(mut_files):
-            break
-        orig_idx = i + trim_start
-        if orig_idx >= len(orig_files):
-            break
-        orig = cv2.imread(os.path.join(ctx.frames_dir, orig_files[orig_idx]))
-        mut = cv2.imread(os.path.join(ctx.mutated_frames_dir, mut_files[i]))
+        ssim_scores = []
+        for i in sample_indices:
+            if i >= len(mut_files):
+                break
+            orig_idx = i + trim_start
+            if orig_idx >= len(orig_files):
+                break
+            orig = cv2.imread(os.path.join(ctx.frames_dir, orig_files[orig_idx]))
+            mut = cv2.imread(os.path.join(ctx.mutated_frames_dir, mut_files[i]))
 
-        if orig is None or mut is None:
-            continue
+            if orig is None or mut is None:
+                continue
 
-        # Resize if temporal mutation changed frame count
-        if orig.shape != mut.shape:
-            mut = cv2.resize(mut, (orig.shape[1], orig.shape[0]))
+            # Resize if temporal mutation changed frame count
+            if orig.shape != mut.shape:
+                mut = cv2.resize(mut, (orig.shape[1], orig.shape[0]))
 
-        score = ssim(orig, mut, channel_axis=2)
-        ssim_scores.append(score)
+            score = ssim(orig, mut, channel_axis=2)
+            ssim_scores.append(score)
 
         if ssim_scores:
             ctx.ssim_score = float(np.mean(ssim_scores))
