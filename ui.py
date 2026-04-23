@@ -7,27 +7,19 @@ Runs preflight → shows GPU report → lets user configure → runs pipeline.
 
 import os
 import sys
+import uuid
 import threading
 import logging
 import traceback
 
-# ---------------------------------------------------------------------------
-# Python 3.10+ compatibility: collections.MutableMapping was removed in 3.10.
-# It was moved to collections.abc in Python 3.3. Many third-party packages
-# still reference collections.MutableMapping, so we monkey-patch it back.
-# ---------------------------------------------------------------------------
-import collections
-import collections.abc
-for _attr in ('MutableMapping', 'MutableSequence', 'MutableSet',
-              'Mapping', 'Sequence', 'Set', 'Callable', 'Iterable',
-              'Iterator', 'MutableSet'):
-    if not hasattr(collections, _attr) and hasattr(collections.abc, _attr):
-        setattr(collections, _attr, getattr(collections.abc, _attr))
+# Project root on path (needed before compat import)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Python 3.10+ compatibility — must be imported before any third-party deps
+import compat  # noqa: F401
 
 import gradio as gr
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from preflight import run_preflight, format_report
 from pipeline import Pipeline, PipelineConfig, PipelineContext
 
@@ -40,14 +32,16 @@ logging.basicConfig(level=logging.INFO, format="%(name)s | %(levelname)s | %(mes
 # ---------------------------------------------------------------------------
 
 _pipeline_result = {"running": False, "log": "", "output_path": ""}
+_pipeline_lock = threading.Lock()
+_cancel_event = threading.Event()
 
 
 def _run_pipeline_thread(input_path, work_dir, config_dict):
     """Run the pipeline in a background thread, update shared state."""
-    global _pipeline_result
-    _pipeline_result["running"] = True
-    _pipeline_result["log"] = "Starting pipeline...\n"
-    _pipeline_result["output_path"] = ""
+    with _pipeline_lock:
+        _pipeline_result["running"] = True
+        _pipeline_result["log"] = "Starting pipeline...\n"
+        _pipeline_result["output_path"] = ""
 
     # Build config from UI values
     cfg = PipelineConfig(
@@ -85,31 +79,105 @@ def _run_pipeline_thread(input_path, work_dir, config_dict):
     # Capture logs
     class LogCapture(logging.Handler):
         def emit(self, record):
-            _pipeline_result["log"] += record.getMessage() + "\n"
+            with _pipeline_lock:
+                _pipeline_result["log"] += record.getMessage() + "\n"
 
     handler = LogCapture()
     handler.setLevel(logging.INFO)
     logger.addHandler(handler)
 
+    # Create a fresh cancel event for this run and pass it through context
+    cancel_evt = _cancel_event
+
     try:
-        ctx = pipe.run(input_path, output_dir=work_dir)
-        _pipeline_result["output_path"] = ctx.output_path
-        _pipeline_result["log"] += "\n=== PIPELINE COMPLETE ===\n"
-        for entry in ctx.log:
-            _pipeline_result["log"] += entry + "\n"
-        _pipeline_result["log"] += "\nSSIM: {:.4f}\n".format(ctx.ssim_score)
-        _pipeline_result["log"] += "Original hash:  {}\n".format(ctx.original_hash[:32])
-        _pipeline_result["log"] += "Output hash:    {}\n".format(ctx.output_hash[:32])
-        _pipeline_result["log"] += "Hash changed:   {}\n".format(
-            "YES" if ctx.output_hash != ctx.original_hash else "NO"
-        )
-        _pipeline_result["log"] += "\nOutput file: {}\n".format(ctx.output_path)
+        # Run pipeline with cancel event injected into context
+        # Pipeline.run creates a PipelineContext internally; we override
+        # its cancel_event after creation via a wrapper
+        ctx = PipelineContext(config=cfg)
+        ctx.input_path = input_path
+        ctx.work_dir = work_dir
+        ctx.cancel_event = cancel_evt
+
+        # Run the pipeline stages manually so we can inject the cancel event
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            ctx.vram_mb = props.total_memory // (1024 * 1024)
+            ctx.device = "cuda:0"
+            if ctx.vram_mb < 6000 and ctx.config.gan_resolution > 512:
+                logger.info("Auto-downscaling GAN to 512x512 (VRAM={}MB)".format(ctx.vram_mb))
+                ctx.config.gan_resolution = 512
+            if ctx.vram_mb < 4000:
+                logger.info("Switching to EfficientNet-B0 (low VRAM)")
+                ctx.config.adv_model = "efficientnet_b0"
+            if ctx.vram_mb < 2000:
+                logger.info("Disabling GAN (insufficient VRAM)")
+                ctx.config.gan_enabled = False
+        else:
+            ctx.device = "cpu"
+            ctx.config.gan_enabled = False
+
+        logger.info("=" * 50)
+        logger.info("VIDEO UNIQUIELIZER — Starting Pipeline")
+        logger.info("Input: {}".format(input_path))
+        logger.info("GPU: {} ({}MB)".format(ctx.device, ctx.vram_mb))
+        logger.info("=" * 50)
+
+        for stage in pipe.stages:
+            # Check for cancellation before each stage
+            if ctx.cancel_event.is_set():
+                logger.warning("Pipeline CANCELLED before stage '{}'".format(stage.name))
+                ctx.log.append("CANCELLED before stage: {}".format(stage.name))
+                raise RuntimeError("Pipeline cancelled by user")
+            try:
+                logger.info("")
+                stage.run(ctx)
+            except Exception as e:
+                logger.error("Stage '{}' FAILED: {}".format(stage.name, e))
+                ctx.log.append("ERROR in {}: {}".format(stage.name, e))
+                raise
+
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("PIPELINE COMPLETE")
+        logger.info("Output: {}".format(ctx.output_path))
+        logger.info("SSIM: {:.4f}".format(ctx.ssim_score))
+        logger.info("Hash: {} → {}".format(
+            ctx.original_hash[:16], ctx.output_hash[:16]
+        ))
+        logger.info("=" * 50)
+
+        # Cleanup temporary working files
+        pipe._cleanup_work_dir(ctx)
+
+        with _pipeline_lock:
+            _pipeline_result["output_path"] = ctx.output_path
+            _pipeline_result["log"] += "\n=== PIPELINE COMPLETE ===\n"
+            for entry in ctx.log:
+                _pipeline_result["log"] += entry + "\n"
+            _pipeline_result["log"] += "\nSSIM: {:.4f}\n".format(ctx.ssim_score)
+            _pipeline_result["log"] += "Original hash: {}\n".format(ctx.original_hash[:32])
+            _pipeline_result["log"] += "Output hash: {}\n".format(ctx.output_hash[:32])
+            _pipeline_result["log"] += "Hash changed: {}\n".format(
+                "YES" if ctx.output_hash != ctx.original_hash else "NO"
+            )
+            _pipeline_result["log"] += "\nOutput file: {}\n".format(ctx.output_path)
+    except RuntimeError as e:
+        if "cancelled" in str(e).lower():
+            with _pipeline_lock:
+                _pipeline_result["log"] += "\n=== PIPELINE CANCELLED ===\n"
+        else:
+            with _pipeline_lock:
+                _pipeline_result["log"] += "\n!!! PIPELINE ERROR !!!\n"
+                _pipeline_result["log"] += traceback.format_exc()
     except Exception as e:
-        _pipeline_result["log"] += "\n!!! PIPELINE ERROR !!!\n"
-        _pipeline_result["log"] += traceback.format_exc()
+        with _pipeline_lock:
+            _pipeline_result["log"] += "\n!!! PIPELINE ERROR !!!\n"
+            _pipeline_result["log"] += traceback.format_exc()
     finally:
         logger.removeHandler(handler)
-        _pipeline_result["running"] = False
+        with _pipeline_lock:
+            _pipeline_result["running"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +190,15 @@ def run_preflight_check():
 
 
 def start_pipeline(video_file, *settings):
-    global _pipeline_result
-    if _pipeline_result["running"]:
-        return "Pipeline already running. Please wait.", ""
+    with _pipeline_lock:
+        if _pipeline_result["running"]:
+            return "Pipeline already running. Click Cancel to stop it first.", ""
 
     if video_file is None:
         return "Please upload a video file first.", ""
+
+    # Reset cancel event for a fresh run
+    _cancel_event.clear()
 
     # Unpack settings — order must match the UI layout
     config_dict = {
@@ -160,7 +231,10 @@ def start_pipeline(video_file, *settings):
         "ssim_threshold": settings[26],
     }
 
-    work_dir = os.path.join("/kaggle/working", "uniquelizer_output")
+    work_dir = os.path.join(
+        os.environ.get("UNIQUIELIZER_OUTPUT_DIR", os.path.join(os.getcwd(), "uniquelizer_output")),
+        "run_{}".format(uuid.uuid4().hex[:8])
+    )
     os.makedirs(work_dir, exist_ok=True)
 
     thread = threading.Thread(
@@ -169,18 +243,38 @@ def start_pipeline(video_file, *settings):
         daemon=True
     )
     thread.start()
-    return "Pipeline started! Click 'Refresh Log' to see progress.", ""
+    return "Pipeline started! Log will auto-refresh.", ""
+
+
+def cancel_pipeline():
+    """Set the cancel flag to abort the running pipeline."""
+    _cancel_event.set()
+    with _pipeline_lock:
+        if _pipeline_result["running"]:
+            return "Cancel requested — pipeline will stop at the next stage boundary."
+        else:
+            return "No pipeline is currently running."
 
 
 def refresh_log():
-    return _pipeline_result.get("log", "No pipeline run yet.")
+    with _pipeline_lock:
+        return _pipeline_result.get("log", "No pipeline run yet.")
+
+
+def auto_refresh_log():
+    """Called by the timer to periodically update the log display."""
+    with _pipeline_lock:
+        log_text = _pipeline_result.get("log", "No pipeline run yet.")
+        running = _pipeline_result.get("running", False)
+    return log_text, "Pipeline running..." if running else "Idle"
 
 
 def get_output_file():
-    path = _pipeline_result.get("output_path", "")
-    if path and os.path.exists(path):
-        return path
-    return None
+    with _pipeline_lock:
+        path = _pipeline_result.get("output_path", "")
+        if path and os.path.exists(path):
+            return path
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +472,7 @@ def build_ui():
             gr.Markdown("---")
             with gr.Row():
                 run_btn = gr.Button("Run Pipeline", variant="primary", size="lg")
+                cancel_btn = gr.Button("Cancel", variant="stop", size="lg")
                 refresh_btn = gr.Button("Refresh Log", variant="secondary")
 
             with gr.Row():
@@ -400,14 +495,22 @@ def build_ui():
                 outputs=[status_output, log_output]
             )
 
+            cancel_btn.click(fn=cancel_pipeline, outputs=status_output)
             refresh_btn.click(fn=refresh_log, outputs=log_output)
+
+            # Auto-refresh timer: updates log and status every 2 seconds
+            auto_timer = gr.Timer(value=2.0)
+            auto_timer.tick(
+                fn=auto_refresh_log,
+                outputs=[log_output, status_output]
+            )
 
         # ---- Results Tab ----
         with gr.Tab("3. Results"):
             gr.Markdown("### Download the uniquelized video")
             with gr.Row():
                 download_btn = gr.Button("Get Output File")
-            file_output = gr.File(label="Uniquelized Video")
+                file_output = gr.File(label="Uniquelized Video")
 
             def _download():
                 path = get_output_file()
@@ -417,7 +520,7 @@ def build_ui():
 
             download_btn.click(fn=_download, outputs=file_output)
 
-    return app
+        return app
 
 
 # ---------------------------------------------------------------------------

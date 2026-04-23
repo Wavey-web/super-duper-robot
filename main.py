@@ -17,21 +17,11 @@ import os
 import argparse
 import logging
 
-# ---------------------------------------------------------------------------
-# Python 3.10+ compatibility: collections.MutableMapping was removed in 3.10.
-# It was moved to collections.abc in Python 3.3. Many third-party packages
-# still reference collections.MutableMapping, so we monkey-patch it back.
-# ---------------------------------------------------------------------------
-import collections
-import collections.abc
-for _attr in ('MutableMapping', 'MutableSequence', 'MutableSet',
-              'Mapping', 'Sequence', 'Set', 'Callable', 'Iterable',
-              'Iterator', 'MutableSet'):
-    if not hasattr(collections, _attr) and hasattr(collections.abc, _attr):
-        setattr(collections, _attr, getattr(collections.abc, _attr))
-
-# Project root on path
+# Project root on path (needed before compat import)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Python 3.10+ compatibility — must be imported before any third-party deps
+import compat  # noqa: F401
 
 from preflight import run_preflight, format_report
 from pipeline import Pipeline, PipelineConfig

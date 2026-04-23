@@ -17,22 +17,16 @@ import struct
 import tempfile
 import subprocess
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Python 3.10+ compatibility: collections.MutableMapping was removed in 3.10.
-# It was moved to collections.abc in Python 3.3. Many third-party packages
-# still reference collections.MutableMapping, so we monkey-patch it back.
-# ---------------------------------------------------------------------------
-import collections
-import collections.abc
-for _attr in ('MutableMapping', 'MutableSequence', 'MutableSet',
-              'Mapping', 'Sequence', 'Set', 'Callable', 'Iterable',
-              'Iterator', 'MutableSet'):
-    if not hasattr(collections, _attr) and hasattr(collections.abc, _attr):
-        setattr(collections, _attr, getattr(collections.abc, _attr))
+# Python 3.10+ compatibility — must be imported before any third-party deps
+import sys as _sys
+import os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import compat  # noqa: F401
 
 import numpy as np
 import cv2
@@ -40,6 +34,120 @@ from scipy.fftpack import dct, idct
 from skimage.metrics import structural_similarity as ssim
 
 logger = logging.getLogger("uniquelizer")
+
+# ---------------------------------------------------------------------------
+# Input sanitization & validation (Fix #10)
+# ---------------------------------------------------------------------------
+
+_ALLOWED_ENCODERS = {"auto", "h264_nvenc", "libx264", "libx265", "vp9"}
+
+def _validate_path(file_path: str, work_dir: str, label: str = "path") -> str:
+    """Sanitize a file path: reject traversals, confirm it resolves within work_dir.
+    
+    Returns the resolved path on success. Raises ValueError on failure.
+    """
+    if not file_path:
+        raise ValueError("{} is empty".format(label))
+    if ".." in file_path:
+        raise ValueError("{} contains forbidden '..' traversal: {}".format(label, file_path))
+    resolved = os.path.realpath(file_path)
+    # For input_path, just ensure it exists and is absolute after resolution
+    # For work_dir-relative paths, check containment
+    if work_dir:
+        resolved_root = os.path.realpath(work_dir)
+        if not resolved.startswith(resolved_root + os.sep) and resolved != resolved_root:
+            # Allow the input file to be outside work_dir (it's the source video)
+            # But output/intermediate paths must be inside work_dir
+            if label != "input_path":
+                raise ValueError(
+                    "{} ({}) resolves outside work_dir ({})".format(label, resolved, resolved_root)
+                )
+    return resolved
+
+
+def _validate_encoder(encoder: str) -> str:
+    """Validate encoder name against an allowlist. Returns the encoder on success."""
+    if encoder not in _ALLOWED_ENCODERS:
+        raise ValueError(
+            "Invalid encoder '{}'. Allowed: {}".format(encoder, ", ".join(sorted(_ALLOWED_ENCODERS)))
+        )
+    return encoder
+
+
+def _validate_crf(crf: int) -> int:
+    """Validate CRF/CQP value is an integer in range 0-51."""
+    if not isinstance(crf, int):
+        try:
+            crf = int(crf)
+        except (TypeError, ValueError):
+            raise ValueError("CRF must be an integer, got: {!r}".format(crf))
+    if crf < 0 or crf > 51:
+        raise ValueError("CRF must be in range 0-51, got: {}".format(crf))
+    return crf
+
+
+def _validate_config(cfg: "PipelineConfig") -> None:
+    """Validate all user-facing PipelineConfig fields before running the pipeline.
+    Raises ValueError if any field is out of bounds or invalid.
+    """
+    _validate_encoder(cfg.encoder)
+    _validate_crf(cfg.crf)
+
+    # JND model allowlist
+    allowed_jnd = {"watson_dct", "simple_luminance", "off"}
+    if cfg.jnd_model not in allowed_jnd:
+        raise ValueError(
+            "Invalid jnd_model '{}'. Allowed: {}".format(cfg.jnd_model, ", ".join(sorted(allowed_jnd)))
+        )
+
+    # Adversarial method allowlist
+    allowed_adv_method = {"fgsm", "random_uniform"}
+    if cfg.adv_method not in allowed_adv_method:
+        raise ValueError(
+            "Invalid adv_method '{}'. Allowed: {}".format(
+                cfg.adv_method, ", ".join(sorted(allowed_adv_method))
+            )
+        )
+
+    # Adversarial model allowlist
+    allowed_adv_model = {"efficientnet_b0", "mobilenetv3", "resnet50"}
+    if cfg.adv_model not in allowed_adv_model:
+        raise ValueError(
+            "Invalid adv_model '{}'. Allowed: {}".format(
+                cfg.adv_model, ", ".join(sorted(allowed_adv_model))
+            )
+        )
+
+    # GAN resolution allowlist
+    allowed_gan_res = {512, 1024}
+    if cfg.gan_resolution not in allowed_gan_res:
+        raise ValueError(
+            "Invalid gan_resolution '{}'. Allowed: {}".format(
+                cfg.gan_resolution, ", ".join(str(x) for x in sorted(allowed_gan_res))
+            )
+        )
+
+    # Numeric range checks
+    if cfg.gaussian_sigma < 0:
+        raise ValueError("gaussian_sigma must be >= 0, got: {}".format(cfg.gaussian_sigma))
+    if not (0 <= cfg.lsb_flip_count <= 8):
+        raise ValueError("lsb_flip_count must be 0-8, got: {}".format(cfg.lsb_flip_count))
+    if cfg.jnd_sensitivity <= 0:
+        raise ValueError("jnd_sensitivity must be > 0, got: {}".format(cfg.jnd_sensitivity))
+    if not (0 <= cfg.gan_blend_alpha <= 1):
+        raise ValueError("gan_blend_alpha must be 0-1, got: {}".format(cfg.gan_blend_alpha))
+    if cfg.gan_latent_delta <= 0:
+        raise ValueError("gan_latent_delta must be > 0, got: {}".format(cfg.gan_latent_delta))
+    if cfg.adv_epsilon < 0:
+        raise ValueError("adv_epsilon must be >= 0, got: {}".format(cfg.adv_epsilon))
+    if cfg.temporal_trim_frames < 0:
+        raise ValueError("temporal_trim_frames must be >= 0, got: {}".format(cfg.temporal_trim_frames))
+    if not (0 <= cfg.ssim_threshold <= 1):
+        raise ValueError("ssim_threshold must be 0-1, got: {}".format(cfg.ssim_threshold))
+
+    logger.info("Config validation passed")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +203,15 @@ class PipelineContext:
     # Video
     input_path: str = ""
     work_dir: str = ""
-    frames_dir: str = ""          # extracted frames
-    audio_path: str = ""          # extracted audio WAV
+    frames_dir: str = ""  # extracted frames
+    audio_path: str = ""  # extracted audio WAV
     mutated_frames_dir: str = ""  # output frames
     output_path: str = ""
     frame_count: int = 0
     fps: float = 30.0
     width: int = 0
     height: int = 0
+    trim_start: int = 0  # frames trimmed from start by TemporalMutationStage
     # GPU
     device: str = "cuda:0"
     vram_mb: int = 0
@@ -114,6 +223,8 @@ class PipelineContext:
     # Status
     log: list = field(default_factory=list)
     current_stage: str = ""
+    # Cancellation support — set this Event from another thread to abort
+    cancel_event: object = field(default_factory=threading.Event)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +244,9 @@ class DemuxStage:
         ctx.audio_path = os.path.join(ctx.work_dir, "audio_original.wav")
         os.makedirs(ctx.frames_dir, exist_ok=True)
         os.makedirs(ctx.mutated_frames_dir, exist_ok=True)
+
+        # Validate input path before passing to subprocess
+        _validate_path(ctx.input_path, "", label="input_path")
 
         # Get video info
         probe = subprocess.run(
@@ -168,6 +282,9 @@ class DemuxStage:
             f for f in os.listdir(ctx.frames_dir)
             if f.endswith(".png")
         ])
+
+        # Validate audio output path
+        _validate_path(ctx.audio_path, ctx.work_dir, label="audio_path")
 
         # Extract audio
         has_audio = True
@@ -542,6 +659,13 @@ class AdversarialStage:
         """FGSM: one-step gradient sign perturbation."""
         import torch
 
+        if Image is None:
+            logger.warning(
+                "PIL/Pillow not available — falling back to random uniform perturbation"
+            )
+            self._run_random(ctx, frame_files)
+            return
+
         self._load_classifier(ctx)
         device = torch.device(ctx.device)
         cfg = ctx.config
@@ -674,7 +798,8 @@ class TemporalMutationStage:
 
             frame_files = new_files
             ctx.frame_count = len(frame_files)
-            logger.info("  Trimmed: -{} start, -{} end = {} frames".format(
+            ctx.trim_start = trim_start
+            logger.info(" Trimmed: -{} start, -{} end = {} frames".format(
                 trim_start, trim_end, ctx.frame_count
             ))
 
@@ -687,33 +812,51 @@ class TemporalMutationStage:
             ))
 
         # --- Frame jitter: per-frame timestamp offset ---
-        # Stored as metadata that FFmpeg picks up during re-encode.
-        # We implement this by duplicating/dropping occasional frames
-        # to simulate micro-timing changes.
+        # We implement this by duplicating occasional frames
+        # to simulate micro-timing changes. Uses a staging directory
+        # to avoid O(n^2) in-place renames and rename collisions.
         if cfg.temporal_jitter_ms > 0:
             jitter_frames = max(1, int(cfg.temporal_jitter_ms * ctx.fps / 1000))
-            # Randomly duplicate 1-2 frames (creates imperceptible stutter)
-            dup_positions = np.random.choice(
-                len(frame_files), size=min(jitter_frames, len(frame_files) // 10),
+            import shutil
+            # Build the new frame sequence in a temp dir, then swap
+            jitter_tmp = os.path.join(ctx.work_dir, "jitter_staging")
+            os.makedirs(jitter_tmp, exist_ok=True)
+
+            dup_positions = set(np.random.choice(
+                len(frame_files), size=min(jitter_frames, max(1, len(frame_files) // 10)),
                 replace=False
-            )
-            for pos in sorted(dup_positions, reverse=True):
-                src = os.path.join(ctx.mutated_frames_dir, frame_files[pos])
-                # Re-number everything after this position
-                for j in range(len(frame_files) - 1, pos, -1):
-                    src_j = os.path.join(ctx.mutated_frames_dir, frame_files[j])
-                    dst_j = os.path.join(ctx.mutated_frames_dir,
-                                          "frame_{:06d}.png".format(j + 2))
-                    os.rename(src_j, dst_j)
-                # Duplicate the frame
-                dup_name = "frame_{:06d}.png".format(pos + 2)
-                import shutil
-                shutil.copy2(src, os.path.join(ctx.mutated_frames_dir, dup_name))
+            ))
+            new_idx = 0
+            for i, fname in enumerate(frame_files):
+                src = os.path.join(ctx.mutated_frames_dir, fname)
+                # Copy the frame to the staging dir with sequential naming
+                dst = os.path.join(jitter_tmp, "frame_{:06d}.png".format(new_idx + 1))
+                shutil.copy2(src, dst)
+                new_idx += 1
+                # If this position is marked for duplication, copy again
+                if i in dup_positions:
+                    dup_dst = os.path.join(jitter_tmp, "frame_{:06d}.png".format(new_idx + 1))
+                    shutil.copy2(src, dup_dst)
+                    new_idx += 1
+
+            # Remove old frames and move staged frames back
+            for old_f in frame_files:
+                old_path = os.path.join(ctx.mutated_frames_dir, old_f)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            for staged_f in os.listdir(jitter_tmp):
+                if staged_f.endswith(".png"):
+                    shutil.move(
+                        os.path.join(jitter_tmp, staged_f),
+                        os.path.join(ctx.mutated_frames_dir, staged_f)
+                    )
+            shutil.rmtree(jitter_tmp, ignore_errors=True)
 
             # Refresh file list
             frame_files = sorted([
                 f for f in os.listdir(ctx.mutated_frames_dir) if f.endswith(".png")
             ])
+
             ctx.frame_count = len(frame_files)
 
         msg = "Temporal mutation done: {} frames, fps={:.2f}".format(
@@ -853,10 +996,19 @@ class ReencodeStage:
 
         logger.info("Stage: Re-encode — encoder={}, quality={}".format(encoder, cfg.crf))
 
+        # Validate encoder and CRF before passing to FFmpeg
+        _validate_encoder(encoder)
+        _validate_crf(cfg.crf)
+
         # Build FFmpeg command
+        # Validate that output path resolves within work_dir
         ctx.output_path = os.path.join(ctx.work_dir, "output_unique.mp4")
+        _validate_path(ctx.output_path, ctx.work_dir, label="output_path")
 
         cmd = ["ffmpeg", "-y"]
+
+        # Validate frame directories before FFmpeg input
+        _validate_path(ctx.mutated_frames_dir, ctx.work_dir, label="mutated_frames_dir")
 
         # Input: mutated frames
         cmd.extend([
@@ -867,6 +1019,7 @@ class ReencodeStage:
         # Input: audio (if exists)
         has_audio = ctx.audio_path and os.path.exists(ctx.audio_path)
         if has_audio:
+            _validate_path(ctx.audio_path, ctx.work_dir, label="audio_path (re-encode)")
             cmd.extend(["-i", ctx.audio_path])
 
         # Video codec
@@ -946,27 +1099,33 @@ class QAVerificationStage:
             f for f in os.listdir(ctx.mutated_frames_dir) if f.endswith(".png")
         ])
 
-        # Sample frames for SSIM (every 10th frame, up to 30 frames)
-        sample_indices = list(range(0, min(len(orig_files), len(mut_files)), max(1, len(orig_files) // 30)))
-        if not sample_indices:
-            sample_indices = [0]
+    # Sample frames for SSIM (every 10th frame, up to 30 frames).
+    # Account for temporal trimming: mutated frame at index i corresponds
+    # to original frame at index (i + trim_start).
+    trim_start = getattr(ctx, "trim_start", 0)
+    sample_indices = list(range(0, min(len(mut_files), len(orig_files) - trim_start), max(1, len(mut_files) // 30)))
+    if not sample_indices:
+        sample_indices = [0] if len(mut_files) > 0 else []
 
-        ssim_scores = []
-        for i in sample_indices:
-            if i >= len(mut_files):
-                break
-            orig = cv2.imread(os.path.join(ctx.frames_dir, orig_files[i]))
-            mut = cv2.imread(os.path.join(ctx.mutated_frames_dir, mut_files[i]))
+    ssim_scores = []
+    for i in sample_indices:
+        if i >= len(mut_files):
+            break
+        orig_idx = i + trim_start
+        if orig_idx >= len(orig_files):
+            break
+        orig = cv2.imread(os.path.join(ctx.frames_dir, orig_files[orig_idx]))
+        mut = cv2.imread(os.path.join(ctx.mutated_frames_dir, mut_files[i]))
 
-            if orig is None or mut is None:
-                continue
+        if orig is None or mut is None:
+            continue
 
-            # Resize if temporal mutation changed frame count
-            if orig.shape != mut.shape:
-                mut = cv2.resize(mut, (orig.shape[1], orig.shape[0]))
+        # Resize if temporal mutation changed frame count
+        if orig.shape != mut.shape:
+            mut = cv2.resize(mut, (orig.shape[1], orig.shape[0]))
 
-            score = ssim(orig, mut, channel_axis=2)
-            ssim_scores.append(score)
+        score = ssim(orig, mut, channel_axis=2)
+        ssim_scores.append(score)
 
         if ssim_scores:
             ctx.ssim_score = float(np.mean(ssim_scores))
@@ -1012,7 +1171,14 @@ class Pipeline:
 
     def run(self, input_path: str, output_dir: str = None) -> PipelineContext:
         ctx = PipelineContext(config=self.config)
+        # Validate input path (must exist, no traversal)
+        _validate_path(input_path, "", label="input_path")
+        if not os.path.isfile(input_path):
+            raise ValueError("Input file does not exist: {}".format(input_path))
         ctx.input_path = input_path
+        # Validate work_dir if provided
+        if output_dir:
+            _validate_path(output_dir, output_dir, label="output_dir")
         ctx.work_dir = output_dir or os.path.join(
             tempfile.mkdtemp(prefix="uniquelizer_"), "work"
         )
@@ -1044,13 +1210,27 @@ class Pipeline:
         logger.info("GPU: {} ({}MB)".format(ctx.device, ctx.vram_mb))
         logger.info("=" * 50)
 
+        # Validate all config fields before running any stage
+        _validate_config(self.config)
+
         for stage in self.stages:
+            # Check for cancellation before each stage
+            if ctx.cancel_event.is_set():
+                logger.warning(                    "Pipeline CANCELLED before stage '{}'".format(stage.name)
+                )
+                ctx.log.append(                    "CANCELLED before stage: {}".format(stage.name)
+                )
+                raise RuntimeError("Pipeline cancelled by user")
             try:
                 logger.info("")
                 stage.run(ctx)
             except Exception as e:
-                logger.error("Stage '{}' FAILED: {}".format(stage.name, e))
-                ctx.log.append("ERROR in {}: {}".format(stage.name, e))
+                logger.error(
+                    "Stage '{}' FAILED: {}".format(stage.name, e)
+                )
+                ctx.log.append(
+                    "ERROR in {}: {}".format(stage.name, e)
+                )
                 raise
 
         logger.info("")
@@ -1063,7 +1243,37 @@ class Pipeline:
         ))
         logger.info("=" * 50)
 
+        # Cleanup temporary working files (frames, audio) to save disk space.
+        # Only removes the intermediate directories; the output MP4 is kept.
+        self._cleanup_work_dir(ctx)
+
         return ctx
+
+    def _cleanup_work_dir(self, ctx: PipelineContext) -> None:
+        """Remove intermediate frame/audio files after encoding is done.
+        Preserves the output MP4 and any user-specified output directory root."""
+        import shutil
+        dirs_to_clean = [
+            ctx.frames_dir,
+            ctx.mutated_frames_dir,
+        ]
+        files_to_clean = [
+            ctx.audio_path,
+        ]
+        for d in dirs_to_clean:
+            if d and os.path.isdir(d):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                    logger.info("Cleaned up: {}".format(d))
+                except Exception as e:
+                    logger.warning("Failed to clean {}: {}".format(d, e))
+        for f in files_to_clean:
+            if f and os.path.isfile(f):
+                try:
+                    os.remove(f)
+                    logger.info("Cleaned up: {}".format(f))
+                except Exception as e:
+                    logger.warning("Failed to clean {}: {}".format(f, e))
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1284,7 @@ def _sha256_file(path: str) -> str:
     """Compute SHA-256 hash of a file."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda: f.read(1048576), b""):
             h.update(chunk)
     return h.hexdigest()
 
