@@ -39,7 +39,7 @@ logger = logging.getLogger("uniquelizer")
 # Input sanitization & validation (Fix #10)
 # ---------------------------------------------------------------------------
 
-_ALLOWED_ENCODERS = {"auto", "h264_nvenc", "libx264", "libx265", "vp9"}
+_ALLOWED_ENCODERS = {"auto", "h264_nvenc", "libx264", "libx265", "vp9", "libvpx-vp9"}
 
 def _validate_path(file_path: str, work_dir: str, label: str = "path") -> str:
     """Sanitize a file path: reject traversals, confirm it resolves within work_dir.
@@ -975,109 +975,213 @@ class AudioMutationStage:
 # ---------------------------------------------------------------------------
 
 class ReencodeStage:
-    name = "Re-encode + Hash"
+  name = "Re-encode + Hash"
 
-    def run(self, ctx: PipelineContext) -> None:
-        ctx.current_stage = self.name
-        cfg = ctx.config
+  @staticmethod
+  def _detect_nvenc_preset() -> str:
+    """Detect the best NVENC preset string for the installed FFmpeg.
 
-        # Decide encoder
-        encoder = cfg.encoder
-        if encoder == "auto":
-            # Check if NVENC available
-            try:
-                out = subprocess.run(
-                    ["ffmpeg", "-hide_banner", "-encoders"],
-                    capture_output=True, text=True, timeout=10
-                )
-                encoder = "h264_nvenc" if "h264_nvenc" in out.stdout else "libx264"
-            except Exception:
-                encoder = "libx264"
+    NVENC preset names changed across FFmpeg versions:
+     - FFmpeg 5.x+ / SDK 11+: supports 'p1'..'p7' named presets
+     - FFmpeg 4.x / older SDK: only accepts integers (0-18) or legacy
+      names like 'slow', 'medium', 'fast', 'hq', 'hp'
 
-        logger.info("Stage: Re-encode — encoder={}, quality={}".format(encoder, cfg.crf))
+    Passing 'p4' on an older FFmpeg causes:
+      "Undefined constant or missing '(' in 'p4'"
+      'Unable to parse option value "p4"'
 
-        # Validate encoder and CRF before passing to FFmpeg
-        _validate_encoder(encoder)
-        _validate_crf(cfg.crf)
+    Detection strategy (in order):
+     1. Parse -preset option values from encoder help output
+     2. Live test encode with candidate preset
+     3. Fallback through legacy presets (medium, hq, hp, integer 15)
+     4. If no NVENC preset works, raise to signal libx264 fallback
+    """
+    import re
 
-        # Build FFmpeg command
-        # Validate that output path resolves within work_dir
-        ctx.output_path = os.path.join(ctx.work_dir, "output_unique.mp4")
-        _validate_path(ctx.output_path, ctx.work_dir, label="output_path")
+    # Step 1: Parse actual -preset values from help output
+    candidate_presets = []
+    try:
+      out = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-h", "encoder=h264_nvenc"],
+        capture_output=True, text=True, timeout=10
+      )
+      help_text = out.stdout
+      # Look for p-style presets in the help text listing
+      p_presets = re.findall(r"\bp([1-7])\b", help_text)
+      if p_presets:
+        # Prefer p4 (medium quality), fall back to next available
+        for p in ["4", "5", "3", "2", "6", "1", "7"]:
+          if p in p_presets:
+            candidate_presets.append("p" + p)
+            break
+    except Exception:
+      pass
 
-        cmd = ["ffmpeg", "-y"]
+    # If no p-style presets found in help, try legacy names
+    if not candidate_presets:
+      candidate_presets = ["medium", "hq", "hp", "15"]
 
-        # Validate frame directories before FFmpeg input
-        _validate_path(ctx.mutated_frames_dir, ctx.work_dir, label="mutated_frames_dir")
-
-        # Input: mutated frames
-        cmd.extend([
-            "-framerate", str(ctx.fps),
-            "-i", os.path.join(ctx.mutated_frames_dir, "frame_%06d.png")
-        ])
-
-        # Input: audio (if exists)
-        has_audio = ctx.audio_path and os.path.exists(ctx.audio_path)
-        if has_audio:
-            _validate_path(ctx.audio_path, ctx.work_dir, label="audio_path (re-encode)")
-            cmd.extend(["-i", ctx.audio_path])
-
-        # Video codec
-        if encoder == "h264_nvenc":
-            cmd.extend([
-                "-c:v", "h264_nvenc",
-                "-qp", str(cfg.crf),
-                "-preset", "p4",  # NVENC preset (medium quality)
-            ])
-        else:
-            cmd.extend([
-                "-c:v", "libx264",
-                "-crf", str(cfg.crf),
-                "-preset", "slow",
-            ])
-
-        # Pixel format
-        cmd.extend(["-pix_fmt", "yuv420p"])
-
-        # Audio codec
-        if has_audio:
-            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
-        else:
-            cmd.extend(["-an"])
-
-        # --- Hash guarantee: inject random UUID as metadata ---
-        if cfg.inject_uuid:
-            unique_id = str(uuid.uuid4())
-            cmd.extend(["-metadata", "encoding_uuid=" + unique_id])
-            cmd.extend(["-metadata", "unique_id=" + unique_id])
-            logger.info("  Injected UUID: {}".format(unique_id))
-
-        # --- Shuffle MOOV atom: move moov to beginning (faststart) ---
-        if cfg.shuffle_moov:
-            cmd.extend(["-movflags", "+faststart+frag_keyframe"])
-
-        cmd.append(ctx.output_path)
-
-        logger.info("  Encoding: {}".format(" ".join(cmd[:8]) + "..."))
-        result = subprocess.run(cmd, capture_output=True, timeout=1800)
-
-        if result.returncode != 0:
-            logger.error("FFmpeg encode failed: {}".format(result.stderr[-500:]))
-            raise RuntimeError("FFmpeg encoding failed")
-
-        # Compute output hash
-        ctx.output_hash = _sha256_file(ctx.output_path)
-
-        msg = "Re-encode done: {} ({}), hash={}".format(
-            encoder, cfg.crf, ctx.output_hash[:16] + "..."
+    # Step 2: Live test encode with each candidate preset
+    for preset in candidate_presets:
+      try:
+        test_cmd = [
+          "ffmpeg", "-hide_banner", "-loglevel", "error",
+          "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+          "-c:v", "h264_nvenc", "-preset", preset,
+          "-f", "null", "-",
+        ]
+        result = subprocess.run(
+          test_cmd, capture_output=True, text=True, timeout=15
         )
-        logger.info(msg)
-        ctx.log.append(msg)
-        ctx.log.append("Original hash:  {}".format(ctx.original_hash[:16] + "..."))
-        ctx.log.append("Output hash:    {}".format(ctx.output_hash[:16] + "..."))
-        ctx.log.append("Hash changed:   {}".format(
-            "YES" if ctx.output_hash != ctx.original_hash else "NO (PROBLEM!)"
-        ))
+        if result.returncode == 0:
+          logger.info("NVENC preset '{}' verified via test encode".format(preset))
+          return preset
+        else:
+          logger.debug("NVENC preset '{}' rejected: {}".format(
+            preset, result.stderr[:200].strip()
+          ))
+      except Exception as exc:
+        logger.debug("NVENC preset '{}' test failed: {}".format(preset, exc))
+
+    # Step 3: All NVENC presets failed - signal caller to fall back to libx264
+    logger.warning(
+      "No working NVENC preset found (tried: {}). "
+      "Falling back to libx264 software encoding.".format(
+        ", ".join(candidate_presets) if candidate_presets else "(none)"
+      )
+    )
+    raise RuntimeError("NVENC_UNAVAILABLE")
+  def run(self, ctx: PipelineContext) -> None:
+    ctx.current_stage = self.name
+    cfg = ctx.config
+
+    # Decide encoder
+    encoder = cfg.encoder
+    if encoder == "auto":
+      # Check if NVENC available
+      try:
+        out = subprocess.run(
+          ["ffmpeg", "-hide_banner", "-encoders"],
+          capture_output=True, text=True, timeout=10
+        )
+        encoder = "h264_nvenc" if "h264_nvenc" in out.stdout else "libx264"
+      except Exception:
+        encoder = "libx264"
+
+    logger.info("Stage: Re-encode — encoder={}, quality={}".format(encoder, cfg.crf))
+
+    # Validate encoder and CRF before passing to FFmpeg
+    _validate_encoder(encoder)
+    _validate_crf(cfg.crf)
+
+    # Build FFmpeg command
+    # Validate that output path resolves within work_dir
+    ctx.output_path = os.path.join(ctx.work_dir, "output_unique.mp4")
+    _validate_path(ctx.output_path, ctx.work_dir, label="output_path")
+
+    cmd = ["ffmpeg", "-y"]
+
+    # Validate frame directories before FFmpeg input
+    _validate_path(ctx.mutated_frames_dir, ctx.work_dir, label="mutated_frames_dir")
+
+    # Input: mutated frames
+    cmd.extend([
+      "-thread_queue_size", "512",
+      "-framerate", str(ctx.fps),
+      "-i", os.path.join(ctx.mutated_frames_dir, "frame_%06d.png")
+    ])
+
+    # Input: audio (if exists)
+    has_audio = ctx.audio_path and os.path.exists(ctx.audio_path)
+    if has_audio:
+      _validate_path(ctx.audio_path, ctx.work_dir, label="audio_path (re-encode)")
+      cmd.extend(["-thread_queue_size", "512", "-i", ctx.audio_path])
+
+    # Video codec
+    if encoder == "h264_nvenc":
+      try:
+        nvenc_preset = self._detect_nvenc_preset()
+        cmd.extend([
+          "-c:v", "h264_nvenc",
+          "-qp", str(cfg.crf),
+          "-preset", nvenc_preset,
+        ])
+        logger.info("  NVENC preset: {} (auto-detected)".format(nvenc_preset))
+      except RuntimeError as e:
+        if "NVENC_UNAVAILABLE" in str(e):
+          # NVENC unusable — fall back to libx264 software encoding
+          encoder = "libx264"
+          ctx.log.append("NVENC unavailable, fell back to libx264")
+          cmd.extend([
+            "-c:v", "libx264",
+            "-crf", str(cfg.crf),
+            "-preset", "medium",
+          ])
+          logger.warning(
+            "NVENC unavailable — using libx264 (preset=medium, crf={})".format(cfg.crf)
+          )
+        else:
+          raise
+    elif encoder == "libx265":
+      cmd.extend([
+        "-c:v", "libx265",
+        "-crf", str(cfg.crf),
+        "-preset", "slow",
+        "-tag:v", "hvc1",
+      ])
+    elif encoder == "vp9":
+      cmd.extend([
+        "-c:v", "libvpx-vp9",
+        "-crf", str(cfg.crf),
+        "-b:v", "0",
+        "-cpu-used", "2",
+      ])
+    else:
+      cmd.extend([
+        "-c:v", "libx264",
+        "-crf", str(cfg.crf),
+        "-preset", "slow",
+      ])
+
+    # Pixel format
+    cmd.extend(["-pix_fmt", "yuv420p"])
+
+    # Audio codec
+    if has_audio:
+      cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+    else:
+      cmd.extend(["-an"])
+
+    # --- Hash guarantee: inject random UUID as metadata ---
+    if cfg.inject_uuid:
+      unique_id = str(uuid.uuid4())
+      cmd.extend(["-metadata", "encoding_uuid=" + unique_id])
+      cmd.extend(["-metadata", "unique_id=" + unique_id])
+      logger.info(" Injected UUID: {}".format(unique_id))
+
+    # --- Shuffle MOOV atom: move moov to beginning (faststart) ---
+    if cfg.shuffle_moov:
+      cmd.extend(["-movflags", "+faststart+frag_keyframe"])
+    cmd.append(ctx.output_path)
+    logger.info(" Encoding: {}".format(" ".join(cmd[:8]) + "..."))
+    result = subprocess.run(cmd, capture_output=True, timeout=1800)
+    if result.returncode != 0:
+      logger.error("FFmpeg encode failed: {}".format(result.stderr[-500:]))
+      raise RuntimeError("FFmpeg encoding failed")
+
+    # Compute output hash
+    ctx.output_hash = _sha256_file(ctx.output_path)
+
+    msg = "Re-encode done: {} ({}), hash={}".format(
+        encoder, cfg.crf, ctx.output_hash[:16] + "..."
+    )
+    logger.info(msg)
+    ctx.log.append(msg)
+    ctx.log.append("Original hash: {}".format(ctx.original_hash[:16] + "..."))
+    ctx.log.append("Output hash: {}".format(ctx.output_hash[:16] + "..."))
+    ctx.log.append("Hash changed: {}".format(
+        "YES" if ctx.output_hash != ctx.original_hash else "NO (PROBLEM!)"
+    ))
 
 
 # ---------------------------------------------------------------------------
