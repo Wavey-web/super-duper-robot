@@ -782,20 +782,34 @@ class TemporalMutationStage:
             trim_end = np.random.randint(0, trim + 1)
             trimmed = frame_files[trim_start: len(frame_files) - trim_end if trim_end > 0 else len(frame_files)]
 
-            # Copy trimmed set back (rename sequentially)
+            # Use temporary directory to avoid rename conflicts
+            import shutil
+            trim_tmp = os.path.join(ctx.work_dir, "trim_staging")
+            os.makedirs(trim_tmp, exist_ok=True)
+
+            # Copy trimmed frames to staging directory with new sequential names
             new_files = []
             for i, fname in enumerate(trimmed):
                 src = os.path.join(ctx.mutated_frames_dir, fname)
                 new_name = "frame_{:06d}.png".format(i + 1)
-                dst = os.path.join(ctx.mutated_frames_dir, new_name)
-                os.rename(src, dst)
+                dst = os.path.join(trim_tmp, new_name)
+                shutil.copy2(src, dst)
                 new_files.append(new_name)
 
-            # Remove leftover frames
+            # Remove all old frames
             for fname in frame_files:
-                if fname not in trimmed and os.path.exists(os.path.join(ctx.mutated_frames_dir, fname)):
-                    os.remove(os.path.join(ctx.mutated_frames_dir, fname))
+                old_path = os.path.join(ctx.mutated_frames_dir, fname)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
 
+            # Move staged frames back
+            for staged_f in new_files:
+                shutil.move(
+                    os.path.join(trim_tmp, staged_f),
+                    os.path.join(ctx.mutated_frames_dir, staged_f)
+                )
+
+            shutil.rmtree(trim_tmp, ignore_errors=True)
             frame_files = new_files
             ctx.frame_count = len(frame_files)
             ctx.trim_start = trim_start
